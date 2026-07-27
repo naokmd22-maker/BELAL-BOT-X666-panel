@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: bot-panel
+    env: node
+    plan: free
+    buildCommand: npm install && cd bot && npm install
+    startCommand: npm start
+    envVars:
+      - key: PANEL_PASSWORD
+        sync: false          # ডিপ্লয়ের সময় Render নিজেই ইনপুট চাইবে
+      - key: MONGODB_URI
+        sync: false          # ডিপ্লয়ের সময় Render নিজেই ইনপুট চাইবে
+      - key: SESSION_SECRET
+        generateValue: true  # Render নিজেই র‌্যান্ডম সিক্রেট বানাবে
+      - key: BOT_DIR
+        value: ./bot
+      - key: BOT_ENTRY
+        value: index.js
+      - key: NODE_VERSION
+        value: 20.11.1
