@@ -228,6 +228,26 @@ async function mongoRestoreFiles() {
   }
 }
 
+// zip এক্সট্র্যাক্ট করার পর যদি সবকিছু একটামাত্র র‍্যাপার ফোল্ডারের ভেতরে থাকে (যেমন GitHub zip-এ
+// "reponame-main/" বা কারো নিজের "bot/" ফোল্ডার), সেটার ভেতরের সবকিছু এক ধাপ উপরে তুলে আনে —
+// নাহলে bot/bot/index.js এর মতো ডাবল-নেস্টেড পাথ তৈরি হয়ে বট চালু হতে ব্যর্থ হয়
+async function flattenSingleRootFolder(dir) {
+  for (let depth = 0; depth < 3; depth++) {
+    let entries;
+    try { entries = await fsp.readdir(dir, { withFileTypes: true }); } catch { return; }
+    const visible = entries.filter((e) => e.name !== "__MACOSX" && !e.name.startsWith("."));
+    if (visible.length !== 1 || !visible[0].isDirectory()) return; // একাধিক আইটেম বা সরাসরি ফাইল থাকলে flatten দরকার নেই
+    const wrapperName = visible[0].name;
+    const wrapperPath = path.join(dir, wrapperName);
+    const inner = await fsp.readdir(wrapperPath, { withFileTypes: true });
+    for (const item of inner) {
+      await fsp.rename(path.join(wrapperPath, item.name), path.join(dir, item.name));
+    }
+    await fsp.rmdir(wrapperPath).catch(() => {});
+    pushLog("info", `📦 zip-এর ভেতরের "${wrapperName}" র‍্যাপার ফোল্ডার সরিয়ে ফাইলগুলো রুটে আনা হলো।`);
+  }
+}
+
 async function walkFiles(dir, base) {
   let out = [];
   let entries;
@@ -284,6 +304,7 @@ async function githubImportZipIfNeeded(force) {
     await fsp.mkdir(CONFIG.BOT_DIR, { recursive: true });
     zip.extractAllTo(CONFIG.BOT_DIR, true);
     await fsp.unlink(tmpZip).catch(() => {});
+    await flattenSingleRootFolder(CONFIG.BOT_DIR);
     pushLog("success", "✅ GitHub zip এক্সট্র্যাক্ট হয়েছে বট ফোল্ডারে।");
 
     const backup = await mongoBackupFiles(); // এখন থেকে MongoDB-ই সোর্স অফ ট্রুথ
@@ -711,6 +732,7 @@ app.post("/api/bot/upload-zip", uploadMem.single("zipfile"), async (req, res) =>
     const zip = new AdmZip(req.file.buffer);
     await fsp.mkdir(CONFIG.BOT_DIR, { recursive: true });
     zip.extractAllTo(CONFIG.BOT_DIR, true);
+    await flattenSingleRootFolder(CONFIG.BOT_DIR);
     pushLog("success", "✅ আপলোড করা zip এক্সট্র্যাক্ট হয়েছে।");
     const backup = await mongoBackupFiles();
     pushNotification("manual-upload", `ফোন থেকে সরাসরি আপলোড করা bot.zip ইম্পোর্ট হয়েছে (${backup.count || 0} ফাইল)।`);
@@ -1151,6 +1173,23 @@ app.post("/api/settings", async (req, res) => {
 app.post("/api/settings/import-now", async (req, res) => {
   const r = await githubImportZipIfNeeded(true); // force=true, সাথে সাথে ইম্পোর্ট, Render রিস্টার্টের অপেক্ষা করতে হবে না
   res.json(r);
+});
+
+// ভুল/ডাবল-নেস্টেড ইম্পোর্ট হয়ে গেলে MongoDB + ডিস্ক থেকে বট ফাইল সম্পূর্ণ মুছে ফেলে —
+// এরপর আবার ইম্পোর্ট/আপলোড করলে একদম ফ্রেশ শুরু হবে
+app.post("/api/settings/wipe-bot-files", async (req, res) => {
+  try {
+    if (mongoDb) {
+      await mongoDb.collection("bot_files").deleteMany({});
+      await mongoDb.collection("state").deleteOne({ _id: "github_import" });
+    }
+    await fsp.rm(CONFIG.BOT_DIR, { recursive: true, force: true }).catch(() => {});
+    await fsp.mkdir(CONFIG.BOT_DIR, { recursive: true });
+    pushLog("warning", "🗑 MongoDB + ডিস্ক থেকে সব বট ফাইল মুছে ফেলা হলো — পরের ইম্পোর্ট/আপলোড একদম ফ্রেশ শুরু হবে।");
+    res.json({ ok: true });
+  } catch (e) {
+    res.json({ ok: false, msg: e.message });
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -1853,6 +1892,13 @@ function renderSettings() {
     <p style="color:var(--muted);font-size:12.5px;">GitHub ছাড়াই — <a href="/upload" style="color:var(--accent);">📤 আপলোড ট্যাবে</a> গিয়ে সরাসরি bot.zip বসিয়ে দিন।</p>
   </div>
 
+  <div class="card" style="border-color:#3a1414;">
+    <h3 style="margin-top:0;color:var(--red);">🗑 বট ফাইল সম্পূর্ণ মুছে ফ্রেশ শুরু করুন</h3>
+    <p style="color:var(--muted);font-size:12.5px;">যদি ভুল/ডাবল-নেস্টেড zip ইম্পোর্ট হয়ে যায় (যেমন <code>bot/bot/index.js</code>), এই বাটন MongoDB + ডিস্ক থেকে সব বট ফাইল মুছে দেবে — এরপর আবার GitHub ইম্পোর্ট বা আপলোড করলে একদম ফ্রেশ শুরু হবে।</p>
+    <button class="btn danger" style="width:100%;justify-content:center;" onclick="wipeBotFiles()">🗑 সব বট ফাইল মুছে ফেলুন</button>
+    <p id="wipeResult" style="font-size:12.5px;color:var(--muted);margin-top:6px;"></p>
+  </div>
+
   <div class="card">
     <h3 style="margin-top:0;">⏰ শিডিউল</h3>
     <label style="font-size:12.5px;color:var(--muted);">রোজ কোন ঘণ্টায় (0-23) বট অটো-রিস্টার্ট হবে (ঐচ্ছিক, ফাঁকা রাখলে বন্ধ)</label>
@@ -1925,6 +1971,16 @@ function renderSettings() {
       .then(function(r){ return r.json(); }).then(function(d){
         document.getElementById('importResult').textContent = d.ok
           ? '✅ ইম্পোর্ট সম্পন্ন! এখন 📁 ফাইল ট্যাবে গিয়ে দেখুন।'
+          : '❌ ব্যর্থ: ' + d.msg;
+      });
+  }
+  function wipeBotFiles(){
+    if (!confirm('নিশ্চিত? এতে MongoDB + ডিস্কের সব বট ফাইল মুছে যাবে (ফেরত আনা যাবে না)।')) return;
+    document.getElementById('wipeResult').textContent = '⏳ মুছে ফেলা হচ্ছে...';
+    fetch('/api/settings/wipe-bot-files', { method: 'POST' })
+      .then(function(r){ return r.json(); }).then(function(d){
+        document.getElementById('wipeResult').textContent = d.ok
+          ? '✅ সব মুছে ফেলা হয়েছে — এখন উপরের "এখনই GitHub থেকে ইম্পোর্ট করুন" বাটন বা 📤 আপলোড ট্যাব থেকে ফ্রেশ ইম্পোর্ট করুন।'
           : '❌ ব্যর্থ: ' + d.msg;
       });
   }
