@@ -17,6 +17,7 @@ const { WebSocketServer } = require("ws");
 const { fork, spawn } = require("child_process");
 const archiver      = require("archiver");
 const cookieParser  = require("cookie-parser");
+const multer        = require("multer");
 
 // ---------------------------------------------------------------------------
 // ০. কনফিগ (env variable থেকে, না থাকলে ডিফল্ট)
@@ -250,20 +251,20 @@ async function walkFiles(dir, base) {
 
 // GitHub রিপোতে রাখা bot.zip — শুধু প্রথমবার (MongoDB-তে কোনো ফাইল ব্যাকআপ না থাকলে) ইম্পোর্ট হয়,
 // এরপর MongoDB-ই সোর্স অফ ট্রুথ — GitHub থেকে zip মুছে দিলেও কোনো সমস্যা নেই
-async function githubImportZipIfNeeded() {
+async function githubImportZipIfNeeded(force) {
   if (!mongoDb) {
     pushLog("warning", "MongoDB কানেক্টেড না — GitHub auto-import নিরাপদে স্কিপ করা হলো (duplicate-import ট্র্যাক করা যাবে না)।");
-    return;
+    return { ok: false, msg: "MongoDB কানেক্টেড না" };
   }
   const existingCount = await mongoDb.collection("bot_files").countDocuments().catch(() => 0);
-  if (existingCount > 0) {
+  if (existingCount > 0 && !force) {
     pushLog("info", "MongoDB-তে আগে থেকেই বট ফাইল ব্যাকআপ আছে — GitHub স্কিপ, MongoDB থেকেই ডিস্কে রিস্টোর করা হচ্ছে (Mongo-ই সোর্স অফ ট্রুথ, ডিস্ক ephemeral)।");
     await mongoRestoreFiles();
-    return;
+    return { ok: true, restored: true };
   }
   if (!CONFIG.GITHUB_REPO) {
     pushLog("info", "GITHUB_REPO সেট নেই এবং MongoDB-তেও কোনো ফাইল নেই — বট শুরু থেকে খালি থাকবে।");
-    return;
+    return { ok: false, msg: "GITHUB_REPO সেট নেই — আগে ⚙️ সেটিংস থেকে বসান" };
   }
   try {
     const axios = require("axios");
@@ -292,9 +293,11 @@ async function githubImportZipIfNeeded() {
       { upsert: true }
     );
     pushNotification("github-import", `GitHub zip ইম্পোর্ট ও MongoDB ব্যাকআপ সম্পন্ন (${backup.count || 0} ফাইল)। এখন GitHub থেকে zip মুছে ফেললেও সমস্যা নেই।`);
+    return { ok: true, count: backup.count || 0 };
   } catch (e) {
     const msg = e.response ? `HTTP ${e.response.status}` : e.message;
     pushLog("error", `❌ GitHub zip ইম্পোর্ট ব্যর্থ: ${msg} (repo/path/token ঠিক আছে কিনা চেক করুন)`);
+    return { ok: false, msg };
   }
 }
 
@@ -654,6 +657,70 @@ app.post("/api/bot/backup", async (req, res) => { const r = await mongoBackupFil
 app.post("/api/bot/mongo-sync", async (req, res) => { await mongoRestoreState(); res.json({ ok: true }); });
 app.post("/api/bot/restore", async (req, res) => { const r = await mongoRestoreFiles(); res.json(r); });
 
+// পেস্ট করা cookie/appstate টেক্সটকে fca-unofficial এর appstate.json ফরম্যাটে রূপান্তর করে
+function parseAppstateInput(raw) {
+  const text = String(raw || "").trim();
+  if (!text) throw new Error("খালি ইনপুট");
+  // ১) ইতিমধ্যে valid JSON appstate array হলে সরাসরি ব্যবহার
+  try {
+    const parsed = JSON.parse(text);
+    if (Array.isArray(parsed)) return parsed;
+  } catch { /* JSON না — নিচে plain cookie হিসেবে পার্স করা হবে */ }
+  // ২) plain cookie string ("name1=value1; name2=value2;") থেকে appstate array বানানো
+  const pairs = text.split(";").map((s) => s.trim()).filter(Boolean);
+  if (!pairs.length) throw new Error("চেনা যায়নি এমন ফরম্যাট — JSON array অথবা 'name=value; ...' ফরম্যাটে দিন");
+  const now = Date.now();
+  return pairs.map((p) => {
+    const idx = p.indexOf("=");
+    if (idx === -1) throw new Error(`অবৈধ কুকি অংশ: ${p}`);
+    return {
+      key: p.slice(0, idx).trim(),
+      value: p.slice(idx + 1).trim(),
+      domain: ".facebook.com",
+      path: "/",
+      hostOnly: false,
+      creation: new Date(now).toISOString(),
+      lastAccessed: new Date(now).toISOString(),
+    };
+  });
+}
+
+app.post("/api/bot/set-appstate", async (req, res) => {
+  try {
+    const appstate = parseAppstateInput(req.body.text);
+    await fsp.mkdir(CONFIG.BOT_DIR, { recursive: true });
+    await fsp.writeFile(path.join(CONFIG.BOT_DIR, "appstate.json"), JSON.stringify(appstate, null, 2), "utf8");
+    pushLog("success", "🍪 Facebook cookie/appstate সেভ হয়েছে — বট চালু করা হচ্ছে।");
+    if (mongoDb) {
+      await mongoBackupFiles().catch(() => {});
+    }
+    restartBot("appstate-updated");
+    res.json({ ok: true });
+  } catch (e) {
+    res.json({ ok: false, msg: e.message });
+  }
+});
+
+// সরাসরি ফোন থেকে bot.zip আপলোড (GitHub ছাড়াই)
+const uploadMem = multer({ storage: multer.memoryStorage(), limits: { fileSize: 150 * 1024 * 1024 } });
+app.post("/api/bot/upload-zip", uploadMem.single("zipfile"), async (req, res) => {
+  try {
+    if (!req.file) return res.json({ ok: false, msg: "কোনো ফাইল পাওয়া যায়নি" });
+    pushLog("info", `📤 ফোন থেকে zip আপলোড হচ্ছে (${Math.round(req.file.size / 1024)} KB)...`);
+    const AdmZip = require("adm-zip");
+    const zip = new AdmZip(req.file.buffer);
+    await fsp.mkdir(CONFIG.BOT_DIR, { recursive: true });
+    zip.extractAllTo(CONFIG.BOT_DIR, true);
+    pushLog("success", "✅ আপলোড করা zip এক্সট্র্যাক্ট হয়েছে।");
+    const backup = await mongoBackupFiles();
+    pushNotification("manual-upload", `ফোন থেকে সরাসরি আপলোড করা bot.zip ইম্পোর্ট হয়েছে (${backup.count || 0} ফাইল)।`);
+    res.json({ ok: true, count: backup.count || 0 });
+  } catch (e) {
+    pushLog("error", "❌ আপলোড ব্যর্থ: " + e.message);
+    res.json({ ok: false, msg: e.message });
+  }
+});
+
 app.get("/api/bot/status", (req, res) => {
   res.json({
     status: STATE.botStatus,
@@ -688,19 +755,38 @@ function countBotFilesSync() {
 // ৮. ফাইল ম্যানেজার
 // ---------------------------------------------------------------------------
 const HIDDEN_FILES = [".crash_flag.json", ".github_import_marker.json", ".DS_Store"];
-const TYPE_COLORS = {
-  code: ["#4fc3f7", [".js", ".ts", ".jsx", ".tsx", ".py", ".json"]],
-  data: ["#81c784", [".csv", ".db", ".sqlite", ".sql"]],
-  media: ["#ba68c8", [".png", ".jpg", ".jpeg", ".gif", ".mp4", ".mp3", ".webp"]],
-  archive: ["#ffb74d", [".zip", ".rar", ".7z", ".tar", ".gz"]],
-  doc: ["#e57373", [".md", ".txt", ".pdf", ".doc", ".docx"]],
+// GitHub-এর ভাষা-রঙের ধাঁচে — এক্সটেনশন অনুযায়ী রঙিন ব্যাজ (label + background + text color)
+const EXT_BADGES = {
+  ".js":   { label: "JS",   bg: "#f1e05a", fg: "#222" },
+  ".jsx":  { label: "JSX",  bg: "#f1e05a", fg: "#222" },
+  ".mjs":  { label: "JS",   bg: "#f1e05a", fg: "#222" },
+  ".ts":   { label: "TS",   bg: "#3178c6", fg: "#fff" },
+  ".tsx":  { label: "TSX",  bg: "#3178c6", fg: "#fff" },
+  ".json": { label: "{ }",  bg: "#cbcb41", fg: "#222" },
+  ".py":   { label: "PY",   bg: "#3572A5", fg: "#fff" },
+  ".md":   { label: "MD",   bg: "#083fa1", fg: "#fff" },
+  ".html": { label: "HTML", bg: "#e34c26", fg: "#fff" },
+  ".css":  { label: "CSS",  bg: "#563d7c", fg: "#fff" },
+  ".sh":   { label: "SH",   bg: "#89e051", fg: "#222" },
+  ".env":  { label: "ENV",  bg: "#6e7681", fg: "#fff" },
+  ".yml":  { label: "YML",  bg: "#cb171e", fg: "#fff" },
+  ".yaml": { label: "YML",  bg: "#cb171e", fg: "#fff" },
+  ".zip":  { label: "ZIP",  bg: "#6e7681", fg: "#fff" },
+  ".rar":  { label: "RAR",  bg: "#6e7681", fg: "#fff" },
+  ".png":  { label: "IMG",  bg: "#a855f7", fg: "#fff" },
+  ".jpg":  { label: "IMG",  bg: "#a855f7", fg: "#fff" },
+  ".jpeg": { label: "IMG",  bg: "#a855f7", fg: "#fff" },
+  ".gif":  { label: "IMG",  bg: "#a855f7", fg: "#fff" },
+  ".webp": { label: "IMG",  bg: "#a855f7", fg: "#fff" },
+  ".txt":  { label: "TXT",  bg: "#89929b", fg: "#fff" },
+  ".db":   { label: "DB",   bg: "#81c784", fg: "#222" },
+  ".sqlite": { label: "DB", bg: "#81c784", fg: "#222" },
+  ".csv":  { label: "CSV",  bg: "#81c784", fg: "#222" },
 };
 function fileBadge(name) {
   const ext = path.extname(name).toLowerCase();
-  for (const [type, [color, exts]] of Object.entries(TYPE_COLORS)) {
-    if (exts.includes(ext)) return { type, color };
-  }
-  return { type: "other", color: "#90a4ae" };
+  if (EXT_BADGES[ext]) return EXT_BADGES[ext];
+  return { label: ext ? ext.slice(1, 4).toUpperCase() : "•", bg: "#475569", fg: "#e2e8f0" };
 }
 
 function safeResolve(relPath) {
@@ -714,8 +800,18 @@ app.get("/files", (req, res) => res.send(renderFiles()));
 app.get("/api/files/list", async (req, res) => {
   const rel = req.query.dir || ".";
   try {
+    await fsp.mkdir(CONFIG.BOT_DIR, { recursive: true }).catch(() => {});
     const full = safeResolve(rel);
-    const entries = await fsp.readdir(full, { withFileTypes: true });
+    let entries;
+    try {
+      entries = await fsp.readdir(full, { withFileTypes: true });
+    } catch (e) {
+      if (e.code === "ENOENT") {
+        // বট এখনো ইম্পোর্ট হয়নি — এরর না দেখিয়ে সহায়ক বার্তা দেওয়া হচ্ছে
+        return res.json({ ok: true, items: [], summary: { folders: 0, files: 0 }, empty: true });
+      }
+      throw e;
+    }
     const items = [];
     for (const e of entries) {
       if (HIDDEN_FILES.includes(e.name)) continue;
@@ -927,6 +1023,7 @@ app.post("/api/test-command", async (req, res) => {
 // ---------------------------------------------------------------------------
 app.get("/monitor", (req, res) => res.send(renderMonitor()));
 app.get("/terminal", (req, res) => res.send(renderTerminal()));
+app.get("/logs", (req, res) => res.send(renderLogs()));
 
 app.get("/api/monitor/data", async (req, res) => {
   let mongoStorageMB = null, mongoEntries = null;
@@ -1030,6 +1127,8 @@ app.get("/more", (req, res) => res.send(renderMore()));
 
 app.get("/settings", (req, res) => res.send(renderSettings()));
 
+app.get("/upload", (req, res) => res.send(renderUpload()));
+
 app.get("/api/settings", (req, res) => {
   res.json({
     ok: true,
@@ -1046,6 +1145,11 @@ app.get("/api/settings", (req, res) => {
 
 app.post("/api/settings", async (req, res) => {
   const r = await saveSettingsToMongo(req.body || {});
+  res.json(r);
+});
+
+app.post("/api/settings/import-now", async (req, res) => {
+  const r = await githubImportZipIfNeeded(true); // force=true, সাথে সাথে ইম্পোর্ট, Render রিস্টার্টের অপেক্ষা করতে হবে না
   res.json(r);
 });
 
@@ -1069,12 +1173,18 @@ function baseCss() {
   :root{--bg:#0b0f14;--panel:#121821;--panel2:#1a2230;--border:#243044;--text:#e6edf3;--muted:#8b98a9;
         --accent:#3b82f6;--green:#22c55e;--yellow:#eab308;--red:#ef4444;--purple:#a855f7;}
   *{box-sizing:border-box;} body{margin:0;background:var(--bg);color:var(--text);
-    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;}
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;padding-bottom:74px;}
   a{color:inherit;text-decoration:none;}
-  .nav{display:flex;overflow-x:auto;background:var(--panel);border-bottom:1px solid var(--border);
-       position:sticky;top:0;z-index:10;}
-  .nav a{padding:14px 16px;white-space:nowrap;color:var(--muted);font-size:14px;border-bottom:2px solid transparent;}
-  .nav a.active{color:var(--text);border-color:var(--accent);}
+  .nav{display:flex;position:fixed;bottom:0;left:0;right:0;background:var(--panel);
+       border-top:1px solid var(--border);z-index:20;padding-top:3px;}
+  .nav a{flex:1;display:flex;flex-direction:column;align-items:center;gap:3px;
+       padding:6px 2px 8px;font-size:10.5px;color:var(--muted);position:relative;}
+  .nav a .navicon{width:32px;height:32px;border-radius:10px;display:flex;align-items:center;
+       justify-content:center;font-size:16px;background:var(--panel2);}
+  .nav a.active{color:var(--text);}
+  .nav a.active .navicon{background:linear-gradient(135deg,var(--accent),var(--purple));}
+  .nav a.active::before{content:'';position:absolute;top:0;left:22%;right:22%;height:3px;
+       background:linear-gradient(90deg,var(--accent),var(--purple));border-radius:0 0 3px 3px;}
   .wrap{max-width:900px;margin:0 auto;padding:14px;}
   .card{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:14px;margin-bottom:12px;}
   .grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;}
@@ -1104,6 +1214,12 @@ function baseCss() {
   .topbar{display:flex;justify-content:space-between;align-items:center;padding:10px 14px;background:var(--panel);}
   .file-row{display:flex;align-items:center;justify-content:space-between;padding:9px 6px;border-bottom:1px solid var(--border);}
   .dot{width:9px;height:9px;border-radius:50%;display:inline-block;margin-right:6px;}
+  .run-badge{display:inline-flex;align-items:center;gap:4px;padding:3px 9px;border-radius:6px;font-size:12px;font-weight:600;}
+  .run-badge.running{background:#3a2f0f;color:#facc15;}
+  .run-badge.pass{background:#0f3a1e;color:#4ade80;}
+  .run-badge.fail{background:#3a1414;color:#f87171;}
+  .spin{display:inline-block;animation:spin 0.8s linear infinite;}
+  @keyframes spin{from{transform:rotate(0deg);}to{transform:rotate(360deg);}}
   `;
 }
 
@@ -1131,11 +1247,11 @@ function clientErrorCatcher() {
 
 function navBar(active) {
   const items = [
-    ["/", "🏠 হোম"], ["/files", "📁 ফাইল"], ["/tester", "🧪 টেস্টার"],
-    ["/monitor", "📊 মনিটর"], ["/terminal", "⚡ টার্মিনাল"], ["/settings", "⚙️ সেটিংস"], ["/more", "⋯ আরো"],
+    ["/", "🏠", "হোম"], ["/monitor", "📊", "মনিটর"], ["/terminal", "⚡", "টার্মিনাল"],
+    ["/logs", "📋", "লগ"], ["/files", "📁", "ফাইল"], ["/upload", "📤", "আপলোড"], ["/more", "⚙️", "আরো"],
   ];
-  return `<div class="nav">${items.map(([href, label]) =>
-    `<a href="${href}" class="${active === href ? "active" : ""}">${label}</a>`).join("")}</div>`;
+  return `<div class="nav">${items.map(([href, icon, label]) =>
+    `<a href="${href}" class="${active === href ? "active" : ""}"><span class="navicon">${icon}</span>${label}</a>`).join("")}</div>`;
 }
 
 function bellWidget() {
@@ -1288,6 +1404,14 @@ function renderHome() {
   </div>
 
   <div class="card">
+    <h3 style="margin-top:0;">🍪 Facebook Cookie / Appstate</h3>
+    <p style="color:var(--muted);font-size:12.5px;">Cookie বা appstate.json পেস্ট করুন → সেভ হয়ে বট চালু হয়ে যাবে</p>
+    <textarea id="appstateInput" rows="4" placeholder='[{"key":"c_user","value":"..."}] অথবা plain cookie string (name=value; name2=value2;)'></textarea>
+    <button class="btn success" style="width:100%;justify-content:center;margin-top:8px;" onclick="saveAppstate()">✅ Cookie সেভ ও বট চালু করুন</button>
+    <p id="appstateResult" style="font-size:12px;color:var(--muted);margin-top:6px;"></p>
+  </div>
+
+  <div class="card">
     <h3 style="margin-top:0;">স্ট্যাট</h3>
     <div class="grid" id="statGrid">
       <div class="stat"><div class="v" id="s-mem">-</div><div class="l">Memory MB</div></div>
@@ -1332,6 +1456,17 @@ function renderHome() {
     if (h) return h + 'ঘ ' + m + 'মি';
     return m + 'মি';
   }
+  function saveAppstate(){
+    var text = document.getElementById('appstateInput').value.trim();
+    if (!text) { alert('আগে cookie/appstate পেস্ট করুন'); return; }
+    document.getElementById('appstateResult').textContent = '⏳ সেভ হচ্ছে...';
+    fetch('/api/bot/set-appstate', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ text: text }) })
+      .then(function(r){ return r.json(); }).then(function(d){
+        document.getElementById('appstateResult').textContent = d.ok
+          ? '✅ সেভ হয়েছে — বট রিস্টার্ট হচ্ছে, নিচের লগে দেখুন।'
+          : '❌ ব্যর্থ: ' + d.msg;
+      });
+  }
   refreshStatus();
   setInterval(refreshStatus, 8000);
   `);
@@ -1373,16 +1508,26 @@ function renderFiles() {
     fetch('/api/files/list?dir=' + encodeURIComponent(curDir)).then(function(r){ return r.json(); }).then(function(d){
       if (!d.ok) { document.getElementById('fileList').textContent = 'এরর: ' + d.msg; return; }
       document.getElementById('summary').textContent = d.summary.folders + ' ফোল্ডার, ' + d.summary.files + ' ফাইল';
+      if (d.empty && curDir === '.') {
+        document.getElementById('fileList').innerHTML =
+          '<p style="color:var(--muted);text-align:center;padding:20px 10px;">📭 এখনো কোনো বট ফাইল নেই।<br>' +
+          '⚙️ সেটিংস ট্যাব থেকে GitHub রিপো বসিয়ে ইম্পোর্ট করুন, অথবা<br>' +
+          '📤 আপলোড ট্যাব থেকে সরাসরি bot.zip আপলোড করুন।</p>';
+        return;
+      }
       var html = '';
       if (curDir !== '.') html += '<div class="file-row" style="cursor:pointer;" onclick="load(parentDir())">⬅️ ফিরে যান</div>';
-      d.items.forEach(function(it){
+      d.items.forEach(function(it, i){
         var full = (curDir === '.' ? '' : curDir + '/') + it.name;
-        var badge = it.isDir ? '📁' : '<span style="color:' + (it.badge ? it.badge.color : '#90a4ae') + ';">●</span>';
+        var badge = it.isDir
+          ? '<span style="width:22px;height:22px;border-radius:5px;background:#37415177;display:inline-flex;align-items:center;justify-content:center;font-size:13px;margin-right:6px;">📁</span>'
+          : '<span style="min-width:30px;height:20px;border-radius:5px;background:' + it.badge.bg + ';color:' + it.badge.fg +
+            ';display:inline-flex;align-items:center;justify-content:center;font-size:9px;font-weight:700;padding:0 4px;margin-right:6px;">' + it.badge.label + '</span>';
         html += '<div class="file-row">' +
-          '<span style="cursor:pointer;flex:1;" onclick="' + (it.isDir ? "load('" + full + "')" : "openFile('" + full + "')") + '">' +
-          badge + ' ' + it.name + '</span>' +
+          '<span style="cursor:pointer;flex:1;display:flex;align-items:center;" onclick="' + (it.isDir ? "load('" + full + "')" : "openFile('" + full + "')") + '">' +
+          badge + it.name + '</span>' +
           '<span>' +
-          (it.isDir ? '' : '<button class="btn" style="padding:4px 8px;" onclick="testFile(\\'' + full + '\\')">🧪</button>') +
+          (it.isDir ? '' : '<span id="runbadge-' + i + '"><button class="btn" style="padding:4px 8px;" onclick="testFile(\\'' + full + '\\',' + i + ',false)">🧪</button></span>') +
           '<button class="btn" style="padding:4px 8px;" onclick="renameItem(\\'' + full + '\\')">✏️</button>' +
           '<button class="btn danger" style="padding:4px 8px;" onclick="deleteItem(\\'' + full + '\\')">🗑</button>' +
           '</span></div>';
@@ -1412,16 +1557,26 @@ function renderFiles() {
         if (d.ok) { closeEditor(); load(curDir); } else alert(d.msg);
       });
   }
-  function testFromEditor(){ testFile(curFile, true); }
-  function testFile(full, inEditor){
+  function testFromEditor(){ testFile(curFile, null, true); }
+  function testFile(full, rowIndex, inEditor){
+    var slot = (rowIndex != null) ? document.getElementById('runbadge-' + rowIndex) : null;
+    if (slot) slot.innerHTML = '<span class="run-badge running"><span class="spin">⟳</span> চলছে</span>';
+    if (inEditor) document.getElementById('editorResult').textContent = '⏳ টেস্ট চলছে...';
     fetch('/api/test-command', { method: 'POST', headers: {'Content-Type':'application/json'},
       body: JSON.stringify({ path: full }) })
       .then(function(r){ return r.json(); }).then(function(d){
         var r = d.result;
-        var msg = (r.verdict === 'ok' ? '✅ ঠিক আছে' : '⚠️ সমস্যা আছে') + ' — সিনট্যাক্স: ' +
-          (r.syntax.ok ? 'ঠিক' : r.syntax.msg);
+        var pass = r.verdict === 'ok';
+        var msg = (pass ? '✅ ঠিক আছে' : '⚠️ সমস্যা আছে') + ' — সিনট্যাক্স: ' + (r.syntax.ok ? 'ঠিক' : r.syntax.msg);
+        if (slot) {
+          slot.innerHTML = '<span class="run-badge ' + (pass ? 'pass' : 'fail') + '" style="cursor:pointer;" onclick="testFile(\\'' + full + '\\',' + rowIndex + ',false)">' +
+            (pass ? '✅' : '❌') + '</span>';
+        }
         if (inEditor) document.getElementById('editorResult').textContent = msg;
-        else alert(msg);
+        if (!slot && !inEditor) alert(msg);
+      })
+      .catch(function(){
+        if (slot) slot.innerHTML = '<span class="run-badge fail">❌</span>';
       });
   }
   function mkNew(isDir){
@@ -1477,14 +1632,14 @@ function renderTester() {
     var p = document.getElementById('testPath').value.trim();
     if (!p) return;
     document.getElementById('verdict').style.display = 'block';
-    document.getElementById('verdict').textContent = 'টেস্ট চলছে...';
+    document.getElementById('verdict').innerHTML = '<span class="run-badge running"><span class="spin">⟳</span> চলছে...</span>';
     fetch('/api/test-command', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ path: p }) })
       .then(function(r){ return r.json(); }).then(function(d){
         var r = d.result;
         var v = document.getElementById('verdict');
-        v.innerHTML = r.verdict === 'ok'
-          ? '<span style="color:var(--green);font-size:18px;">✅ ঠিক আছে</span>'
-          : '<span style="color:var(--yellow);font-size:18px;">⚠️ সমস্যা আছে</span>';
+        var pass = r.verdict === 'ok';
+        v.innerHTML = '<span class="run-badge ' + (pass ? 'pass' : 'fail') + '" style="font-size:15px;">' +
+          (pass ? '✅ ঠিক আছে' : '⚠️ সমস্যা আছে') + '</span>';
         var out = document.getElementById('testResult');
         out.style.display = 'block';
         out.innerHTML =
@@ -1586,8 +1741,45 @@ function renderTerminal() {
   `);
 }
 
+function renderLogs() {
+  return page("লগ", "/logs", `
+  <div class="card" style="background:#000;border-color:#1a2e1a;padding:0;overflow:hidden;">
+    <div style="display:flex;align-items:center;gap:8px;padding:10px 14px;background:#0a120a;border-bottom:1px solid #1a2e1a;">
+      <span style="width:9px;height:9px;border-radius:50%;background:#ef4444;display:inline-block;"></span>
+      <span style="width:9px;height:9px;border-radius:50%;background:#eab308;display:inline-block;"></span>
+      <span style="width:9px;height:9px;border-radius:50%;background:#22c55e;display:inline-block;"></span>
+      <span style="color:#22c55e;font-family:monospace;font-size:12px;margin-left:8px;">live.log</span>
+      <span id="liveDot" style="margin-left:auto;color:#22c55e;font-family:monospace;font-size:11px;">● LIVE</span>
+    </div>
+    <div id="logBox" style="height:74vh;overflow-y:auto;padding:10px 12px;background:#000;font-family:'Courier New',monospace;"></div>
+  </div>
+  `, `
+  // এই পেজে লগ-বক্সের স্টাইল হ্যাকার-টার্মিনাল ধাঁচে ওভাররাইড করা হচ্ছে
+  var style = document.createElement('style');
+  style.textContent =
+    '#logBox .log-line{background:transparent;border-left:none;padding:2px 0;font-size:12px;color:#4ade80;}' +
+    '#logBox .log-error{color:#f87171;}' +
+    '#logBox .log-warning{color:#facc15;}' +
+    '#logBox .log-success{color:#4ade80;text-shadow:0 0 4px rgba(74,222,128,.35);}' +
+    '#logBox .log-info{color:#7dd3fc;}' +
+    '#logBox .log-line::before{content:"$ ";color:#22c55e;opacity:.6;}';
+  document.head.appendChild(style);
+  var blink = true;
+  setInterval(function(){
+    var dot = document.getElementById('liveDot');
+    if (dot) dot.style.opacity = blink ? '1' : '0.25';
+    blink = !blink;
+  }, 600);
+  `);
+}
+
 function renderMore() {
   return page("আরো", "/more", `
+  <div class="card">
+    <h3 style="margin-top:0;">🔗 আরো টুলস</h3>
+    <a href="/tester" class="btn" style="width:100%;justify-content:center;box-sizing:border-box;">🧪 কমান্ড টেস্টার</a>
+    <a href="/settings" class="btn" style="width:100%;justify-content:center;box-sizing:border-box;margin-top:8px;">⚙️ সেটিংস (GitHub, ডেভেলপার তথ্য ইত্যাদি)</a>
+  </div>
   <div class="card">
     <h3 style="margin-top:0;">👤 ডেভেলপার তথ্য</h3>
     <p><b>নাম:</b> ${DEV_INFO.name}<br>
@@ -1604,6 +1796,34 @@ function renderMore() {
     <p style="color:var(--muted);font-size:12px;">Build: ${CONFIG.BUILD_VERSION}</p>
     <a href="/logout" class="btn">লগ আউট</a>
   </div>
+  `);
+}
+
+function renderUpload() {
+  return page("আপলোড", "/upload", `
+  <div class="card">
+    <h3 style="margin-top:0;">📤 সরাসরি ফোন থেকে bot.zip আপলোড</h3>
+    <p style="color:var(--muted);font-size:12.5px;">GitHub এর দরকার নেই — এখান থেকে সরাসরি zip বসিয়ে দিলে সেটা বট ফোল্ডারে এক্সট্র্যাক্ট হয়ে সাথে সাথে MongoDB-তে ব্যাকআপ হয়ে যাবে।</p>
+    <p style="color:var(--yellow);font-size:12px;">⚠️ এটা বর্তমান বট ফোল্ডারের উপর দিয়ে লিখে দেবে (existing ফাইল ওভাররাইট হবে)।</p>
+    <input type="file" id="zipInput" accept=".zip" style="padding:10px;">
+    <button class="btn primary" style="width:100%;justify-content:center;margin-top:10px;" onclick="doUpload()">📤 আপলোড শুরু করুন</button>
+    <div id="uploadProgress" style="margin-top:10px;font-size:13px;color:var(--muted);"></div>
+  </div>
+  `, `
+  function doUpload(){
+    var input = document.getElementById('zipInput');
+    if (!input.files || !input.files[0]) { alert('একটা zip ফাইল বেছে নিন'); return; }
+    var fd = new FormData();
+    fd.append('zipfile', input.files[0]);
+    document.getElementById('uploadProgress').textContent = '⏳ আপলোড হচ্ছে... ফাইল বড় হলে কিছুক্ষণ সময় লাগতে পারে।';
+    fetch('/api/bot/upload-zip', { method: 'POST', body: fd })
+      .then(function(r){ return r.json(); }).then(function(d){
+        document.getElementById('uploadProgress').textContent = d.ok
+          ? '✅ সফল! ' + d.count + ' টা ফাইল ইম্পোর্ট হয়েছে। এখন 📁 ফাইল ট্যাব বা 🏠 হোম থেকে বট চালু করুন।'
+          : '❌ ব্যর্থ: ' + d.msg;
+      })
+      .catch(function(e){ document.getElementById('uploadProgress').textContent = '❌ এরর: ' + e.message; });
+  }
   `);
 }
 
@@ -1624,6 +1844,13 @@ function renderSettings() {
     <input id="s-zippath" placeholder="bot.zip">
     <label style="font-size:12.5px;color:var(--muted);margin-top:8px;display:block;">GitHub Token (শুধু Private রিপো হলে লাগবে)</label>
     <input id="s-token" placeholder="ghp_xxxxxxxx (আগে সেট থাকলে ফাঁকা রাখুন)">
+    <button class="btn primary" style="width:100%;justify-content:center;margin-top:10px;" onclick="importNow()">📥 এখনই GitHub থেকে ইম্পোর্ট করুন</button>
+    <p id="importResult" style="font-size:12.5px;color:var(--muted);margin-top:6px;"></p>
+  </div>
+
+  <div class="card">
+    <h3 style="margin-top:0;">📤 অথবা সরাসরি ফোন থেকে zip আপলোড</h3>
+    <p style="color:var(--muted);font-size:12.5px;">GitHub ছাড়াই — <a href="/upload" style="color:var(--accent);">📤 আপলোড ট্যাবে</a> গিয়ে সরাসরি bot.zip বসিয়ে দিন।</p>
   </div>
 
   <div class="card">
@@ -1679,6 +1906,26 @@ function renderSettings() {
     fetch('/api/settings', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) })
       .then(function(r){ return r.json(); }).then(function(d){
         alert(d.ok ? '✅ সেভ হয়েছে' : '❌ ব্যর্থ: ' + d.msg);
+      });
+  }
+  function importNow(){
+    document.getElementById('importResult').textContent = '⏳ প্রথমে সেটিংস সেভ হচ্ছে, তারপর ইম্পোর্ট শুরু হবে...';
+    var body = {
+      GITHUB_REPO: document.getElementById('s-repo').value,
+      GITHUB_BRANCH: document.getElementById('s-branch').value,
+      GITHUB_ZIP_PATH: document.getElementById('s-zippath').value,
+    };
+    var tokenVal = document.getElementById('s-token').value;
+    if (tokenVal) body.GITHUB_TOKEN = tokenVal;
+    fetch('/api/settings', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) })
+      .then(function(){
+        document.getElementById('importResult').textContent = '📥 GitHub থেকে ইম্পোর্ট চলছে... হোম ট্যাবের লগে অগ্রগতি দেখতে পারবেন।';
+        return fetch('/api/settings/import-now', { method: 'POST' });
+      })
+      .then(function(r){ return r.json(); }).then(function(d){
+        document.getElementById('importResult').textContent = d.ok
+          ? '✅ ইম্পোর্ট সম্পন্ন! এখন 📁 ফাইল ট্যাবে গিয়ে দেখুন।'
+          : '❌ ব্যর্থ: ' + d.msg;
       });
   }
   loadSettings();
