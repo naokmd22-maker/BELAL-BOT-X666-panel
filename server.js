@@ -395,17 +395,130 @@ function pushNotification(type, text) {
 }
 
 // ---------------------------------------------------------------------------
+// ৪ক. Dependency ক্যাশ — node_modules একবার ইনস্টল হলে MongoDB (GridFS)-এ জমা রাখা হয়,
+// যাতে পরের বার npm install (ধীরগতির নেটিভ কম্পাইল সহ) এড়িয়ে সরাসরি ডাউনলোড করে বসানো যায়
+// ---------------------------------------------------------------------------
+const NODE_MODULES_CACHE_MAX_MB = 350; // MongoDB ফ্রি প্ল্যানের স্টোরেজ বাঁচাতে সীমা
+function getDepCacheBucket() {
+  const { GridFSBucket } = require("mongodb");
+  return new GridFSBucket(mongoDb, { bucketName: "node_modules_cache" });
+}
+function computeBotPackageHash() {
+  try {
+    const pkgPath = path.join(CONFIG.BOT_DIR, "package.json");
+    if (!fs.existsSync(pkgPath)) return null;
+    return crypto.createHash("sha256").update(fs.readFileSync(pkgPath)).digest("hex");
+  } catch { return null; }
+}
+
+async function cacheNodeModulesToMongo() {
+  if (!mongoDb) return;
+  const nmPath = path.join(CONFIG.BOT_DIR, "node_modules");
+  if (!fs.existsSync(nmPath)) return;
+  const hash = computeBotPackageHash();
+  if (!hash) return;
+  const tmpZip = path.join(os.tmpdir(), `nm_cache_${Date.now()}.zip`);
+  try {
+    pushLog("info", "📦 node_modules MongoDB-তে ক্যাশ করা হচ্ছে (পরের বার দ্রুত চালু হওয়ার জন্য)...");
+    await new Promise((resolve, reject) => {
+      const output = fs.createWriteStream(tmpZip);
+      const archive = archiver("zip", { zlib: { level: 6 } });
+      archive.pipe(output);
+      archive.directory(nmPath, false);
+      archive.finalize();
+      output.on("close", resolve);
+      archive.on("error", reject);
+    });
+    const stat = await fsp.stat(tmpZip);
+    const sizeMB = Math.round(stat.size / 1024 / 1024);
+    if (stat.size > NODE_MODULES_CACHE_MAX_MB * 1024 * 1024) {
+      pushLog("warning", `⚠️ node_modules ক্যাশ (${sizeMB}MB) সীমার (${NODE_MODULES_CACHE_MAX_MB}MB) চেয়ে বড় — MongoDB স্টোরেজ বাঁচাতে ক্যাশ স্কিপ করা হলো। প্রতিবার ইনস্টলই করতে হবে, অথবা Render পেইড প্ল্যানে Persistent Disk নিন।`);
+      await fsp.unlink(tmpZip).catch(() => {});
+      return;
+    }
+    const bucket = getDepCacheBucket();
+    const oldFiles = await bucket.find({ filename: "node_modules.zip" }).toArray();
+    for (const f of oldFiles) await bucket.delete(f._id).catch(() => {});
+    await new Promise((resolve, reject) => {
+      fs.createReadStream(tmpZip)
+        .pipe(bucket.openUploadStream("node_modules.zip", { metadata: { hash } }))
+        .on("finish", resolve).on("error", reject);
+    });
+    await mongoDb.collection("state").updateOne(
+      { _id: "node_modules_cache" },
+      { $set: { hash, sizeMB, cachedAt: Date.now() } },
+      { upsert: true }
+    );
+    pushLog("success", `✅ node_modules ক্যাশ সম্পন্ন (${sizeMB}MB) — পরের বার npm install ছাড়াই কয়েক সেকেন্ডে চালু হবে।`);
+  } catch (e) {
+    pushLog("warning", "node_modules ক্যাশ করা ব্যর্থ (সমস্যা নেই, স্বাভাবিক ইনস্টল চলবে): " + e.message);
+  } finally {
+    await fsp.unlink(tmpZip).catch(() => {});
+  }
+}
+
+async function restoreNodeModulesCacheFromMongo() {
+  if (!mongoDb) return false;
+  const hash = computeBotPackageHash();
+  if (!hash) return false;
+  try {
+    const meta = await mongoDb.collection("state").findOne({ _id: "node_modules_cache" });
+    if (!meta || meta.hash !== hash) return false; // ক্যাশ নেই, বা package.json পাল্টেছে
+    const bucket = getDepCacheBucket();
+    const files = await bucket.find({ filename: "node_modules.zip" }).toArray();
+    if (!files.length) return false;
+    pushLog("info", `📥 MongoDB-তে ক্যাশ করা node_modules (${meta.sizeMB}MB) পাওয়া গেছে — ডাউনলোড করে বসানো হচ্ছে (npm install এড়িয়ে)...`);
+    const tmpZip = path.join(os.tmpdir(), `nm_restore_${Date.now()}.zip`);
+    await new Promise((resolve, reject) => {
+      bucket.openDownloadStreamByName("node_modules.zip")
+        .pipe(fs.createWriteStream(tmpZip)).on("finish", resolve).on("error", reject);
+    });
+    const AdmZip = require("adm-zip");
+    const zip = new AdmZip(tmpZip);
+    const nmPath = path.join(CONFIG.BOT_DIR, "node_modules");
+    await fsp.mkdir(nmPath, { recursive: true });
+    zip.extractAllTo(nmPath, true);
+    await fsp.unlink(tmpZip).catch(() => {});
+    pushLog("success", `⚡ node_modules ক্যাশ থেকে রিস্টোর সম্পন্ন — npm install লাগেনি!`);
+    return true;
+  } catch (e) {
+    pushLog("warning", "ক্যাশ রিস্টোর ব্যর্থ, স্বাভাবিক ইনস্টল চলবে: " + e.message);
+    return false;
+  }
+}
+
+// বট চালু করার আগে dependency নিশ্চিত করা — ক্যাশ থাকলে সেটা থেকে, নাহলে npm install (এবং সফল হলে ক্যাশ করে রাখা)
+async function ensureBotDependencies() {
+  const nmPath = path.join(CONFIG.BOT_DIR, "node_modules");
+  const pkgPath = path.join(CONFIG.BOT_DIR, "package.json");
+  if (!fs.existsSync(pkgPath)) return; // বটের নিজস্ব package.json নেই — কিছু করার নেই
+  if (fs.existsSync(nmPath)) return;   // ইতিমধ্যে আছে — ধরে নেওয়া হচ্ছে ঠিক আছে
+  pushLog("info", "🔎 বটের node_modules নেই — আগে MongoDB ক্যাশ চেক করা হচ্ছে...");
+  const restored = await restoreNodeModulesCacheFromMongo();
+  if (restored) return;
+  pushLog("info", "📦 ক্যাশ পাওয়া যায়নি — প্রথমবার npm install করা হচ্ছে (নেটিভ মডিউলের কারণে কয়েক মিনিট লাগতে পারে, ধৈর্য ধরুন)...");
+  await runNpmInstall(); // সফল হলে runNpmInstall নিজেই node_modules ক্যাশ করে রাখে
+}
+
+// ---------------------------------------------------------------------------
 // ৪. বট প্রসেস ম্যানেজার (fork + IPC)
 // ---------------------------------------------------------------------------
 function getBotEntryPath() {
   return path.resolve(CONFIG.BOT_DIR, CONFIG.BOT_ENTRY);
 }
 
-function startBot(reason = "manual") {
+async function startBot(reason = "manual") {
   if (STATE.botProcess) {
     pushLog("warning", "বট আগে থেকেই চলছে।");
     return;
   }
+  STATE.botStatus = "booting";
+  STATE.wantBotRunning = true;
+  broadcast({ kind: "status", status: STATE.botStatus });
+  pushLog("info", `▶ বট চালুর প্রস্তুতি নেওয়া হচ্ছে... (কারণ: ${reason})`);
+
+  await ensureBotDependencies(); // ক্যাশ থেকে দ্রুত রিস্টোর, অথবা প্রয়োজনে npm install
+
   if (!fs.existsSync(getBotEntryPath())) {
     pushLog("error", `❌ বট এন্ট্রি ফাইল পাওয়া যায়নি: ${CONFIG.BOT_ENTRY} (পাথ: ${getBotEntryPath()})`);
     logBotDirStructureIfEntryMissing();
@@ -414,10 +527,7 @@ function startBot(reason = "manual") {
     broadcast({ kind: "status", status: STATE.botStatus });
     return;
   }
-  STATE.botStatus = "booting";
-  STATE.wantBotRunning = true;
-  pushLog("info", `▶ বট চালু হচ্ছে... (কারণ: ${reason})`);
-  broadcast({ kind: "status", status: STATE.botStatus });
+  pushLog("info", `▶ বট প্রসেস চালু হচ্ছে... (কারণ: ${reason})`);
 
   const child = fork(getBotEntryPath(), [], {
     cwd: CONFIG.BOT_DIR,
@@ -604,24 +714,39 @@ function runNpmInstall() {
     }
     STATE.npmInstallLock = true;
     STATE.npmInstallStartedAt = Date.now();
-    pushLog("info", "📦 npm install শুরু হচ্ছে...");
+    pushLog("info", "📦 npm install শুরু হচ্ছে... (canvas/better-sqlite3-এর মতো নেটিভ প্যাকেজ থাকলে কয়েক মিনিট পর্যন্ত সময় লাগতে পারে, ধৈর্য ধরুন)");
 
-    const child = spawn("npm", ["install", "--no-audit", "--no-fund"], { cwd: CONFIG.BOT_DIR });
+    const hasLockfile = fs.existsSync(path.join(CONFIG.BOT_DIR, "package-lock.json"));
+    const npmArgs = hasLockfile
+      ? ["ci", "--no-audit", "--no-fund"]
+      : ["install", "--no-audit", "--no-fund"];
+    if (hasLockfile) pushLog("info", "🔒 package-lock.json পাওয়া গেছে — দ্রুত ও নিশ্চিত ইনস্টলের জন্য 'npm ci' ব্যবহার হচ্ছে।");
+    const child = spawn("npm", npmArgs, { cwd: CONFIG.BOT_DIR });
+    const HANG_MINUTES = 20; // ফ্রি প্ল্যানের সীমিত CPU-তে নেটিভ কম্পাইল স্লো হওয়ায় আগের ৫ মিনিট থেকে বাড়ানো হলো
     const hangTimer = setTimeout(() => {
-      pushLog("error", "❌ npm install ৫ মিনিটের বেশি সময় নিচ্ছে — বাতিল করা হলো।");
-      pushNotification("npm-fail", "npm install টাইমআউট হয়েছে (৫ মিনিট)।");
+      pushLog("error", `❌ npm install ${HANG_MINUTES} মিনিটের বেশি সময় নিচ্ছে — বাতিল করা হলো।`);
+      pushNotification("npm-fail", `npm install টাইমআউট হয়েছে (${HANG_MINUTES} মিনিট)।`);
       child.kill("SIGKILL");
-    }, 5 * 60 * 1000);
+    }, HANG_MINUTES * 60 * 1000);
 
-    child.stdout.on("data", (d) => pushLog("info", d.toString().trim()));
-    child.stderr.on("data", (d) => pushLog("warning", d.toString().trim()));
+    let lastProgressLog = Date.now();
+    child.stdout.on("data", (d) => { pushLog("info", d.toString().trim()); lastProgressLog = Date.now(); });
+    child.stderr.on("data", (d) => { pushLog("warning", d.toString().trim()); lastProgressLog = Date.now(); });
 
-    child.on("exit", (code) => {
+    // প্রতি মিনিটে একটা "এখনো চলছে" আপডেট, যাতে ইউজার বুঝতে পারে আটকে যায়নি
+    const heartbeat = setInterval(() => {
+      const mins = Math.round((Date.now() - STATE.npmInstallStartedAt) / 60000);
+      pushLog("info", `⏳ npm install এখনো চলছে (${mins} মিনিট পার হয়েছে)...`);
+    }, 60 * 1000);
+
+    child.on("exit", async (code) => {
       clearTimeout(hangTimer);
+      clearInterval(heartbeat);
       STATE.npmInstallLock = false;
       STATE.npmInstallStartedAt = null;
       if (code === 0) {
         pushLog("success", "✅ npm install সম্পন্ন হয়েছে।");
+        await cacheNodeModulesToMongo(); // পরের বার দ্রুত চালু হওয়ার জন্য ক্যাশ করে রাখা
         resolve({ ok: true });
       } else {
         pushLog("error", `❌ npm install ব্যর্থ (exit ${code})।`);
@@ -811,6 +936,24 @@ app.get("/api/bot/status", (req, res) => {
   });
 });
 
+app.get("/api/bot/dependency-cache", async (req, res) => {
+  if (!mongoDb) return res.json({ ok: true, cached: false, msg: "MongoDB কানেক্টেড নয়" });
+  const meta = await mongoDb.collection("state").findOne({ _id: "node_modules_cache" }).catch(() => null);
+  const currentHash = computeBotPackageHash();
+  res.json({
+    ok: true,
+    cached: !!meta,
+    sizeMB: meta ? meta.sizeMB : null,
+    cachedAt: meta ? meta.cachedAt : null,
+    upToDate: meta ? meta.hash === currentHash : false,
+  });
+});
+
+app.post("/api/bot/dependency-cache/refresh", async (req, res) => {
+  await cacheNodeModulesToMongo();
+  res.json({ ok: true });
+});
+
 function countBotFilesSync() {
   try {
     let n = 0;
@@ -928,6 +1071,35 @@ app.post("/api/files/write", async (req, res) => {
     ).catch(() => {});
     res.json({ ok: true });
   } catch (e) { res.json({ ok: false, msg: e.message }); }
+});
+
+// ফাইল ম্যানেজারের যেকোনো ফোল্ডারের ভেতরে থেকেই সরাসরি (একাধিক) ফাইল আপলোড — বাইনারি-সেফ
+app.post("/api/files/upload-here", uploadMem.array("files", 20), async (req, res) => {
+  try {
+    const dir = req.body.dir || ".";
+    const destDir = safeResolve(dir);
+    await fsp.mkdir(destDir, { recursive: true });
+    const saved = [];
+    for (const f of req.files || []) {
+      const destPath = path.join(destDir, f.originalname);
+      await fsp.writeFile(destPath, f.buffer);
+      const relPath = path.relative(CONFIG.BOT_DIR, destPath);
+      saved.push(relPath);
+      notifyBotFileChange("add", relPath);
+      if (mongoDb && f.buffer.length <= 2 * 1024 * 1024) {
+        try {
+          const asText = f.buffer.toString("utf8");
+          await mongoDb.collection("bot_files").updateOne(
+            { _id: relPath }, { $set: { content: asText, mtime: Date.now() } }, { upsert: true }
+          );
+        } catch { /* বাইনারি ফাইল (ছবি ইত্যাদি) হলে utf8 হিসেবে Mongo-তে সেভ না হয়ে শুধু ডিস্কেই থাকবে */ }
+      }
+    }
+    pushLog("success", `📤 ${saved.length}টা ফাইল আপলোড হয়েছে: /${dir === "." ? "" : dir}`);
+    res.json({ ok: true, count: saved.length, files: saved });
+  } catch (e) {
+    res.json({ ok: false, msg: e.message });
+  }
 });
 
 app.post("/api/files/delete", async (req, res) => {
@@ -1221,6 +1393,25 @@ app.get("/more", (req, res) => res.send(renderMore()));
 app.get("/settings", (req, res) => res.send(renderSettings()));
 
 app.get("/upload", (req, res) => res.send(renderUpload()));
+
+app.get("/api/health-check", async (req, res) => {
+  const checks = [];
+  checks.push({ name: "MongoDB সংযোগ", ok: !!mongoDb, detail: mongoDb ? "সংযুক্ত ✅" : "সংযুক্ত নয়" });
+  const botDirExists = fs.existsSync(CONFIG.BOT_DIR);
+  const fileCount = botDirExists ? countBotFilesSync() : 0;
+  checks.push({ name: "বট ফোল্ডার", ok: botDirExists && fileCount > 0, detail: botDirExists ? `${fileCount}টা ফাইল` : "ফোল্ডার নেই" });
+  const entryExists = fs.existsSync(getBotEntryPath());
+  checks.push({ name: `এন্ট্রি ফাইল (${CONFIG.BOT_ENTRY})`, ok: entryExists, detail: entryExists ? "পাওয়া গেছে ✅" : "পাওয়া যায়নি ❌" });
+  const nmExists = fs.existsSync(path.join(CONFIG.BOT_DIR, "node_modules"));
+  checks.push({ name: "node_modules", ok: nmExists, detail: nmExists ? "ইনস্টল করা আছে" : "নেই" });
+  let depCache = null;
+  if (mongoDb) depCache = await mongoDb.collection("state").findOne({ _id: "node_modules_cache" }).catch(() => null);
+  checks.push({ name: "Dependency ক্যাশ", ok: !!depCache, detail: depCache ? `${depCache.sizeMB}MB ক্যাশ আছে` : "ক্যাশ নেই (প্রথমবার ইনস্টলের পর হবে)" });
+  checks.push({ name: "GitHub রিপো কনফিগ", ok: !!CONFIG.GITHUB_REPO, detail: CONFIG.GITHUB_REPO || "সেট করা নেই (ঐচ্ছিক, আপলোড দিয়েও চলবে)" });
+  checks.push({ name: "বট স্ট্যাটাস", ok: STATE.botStatus === "online", detail: STATE.botStatus });
+  const criticalOk = checks.slice(0, 4).every((c) => c.ok); // Mongo, ফোল্ডার, এন্ট্রি, node_modules — এই ৪টাই আসল
+  res.json({ ok: true, criticalOk, checks });
+});
 
 app.get("/api/settings", (req, res) => {
   res.json({
@@ -1569,6 +1760,12 @@ function renderHome() {
   </div>
 
   <div class="card">
+    <h3 style="margin-top:0;">📦 Dependency ক্যাশ</h3>
+    <p id="depCacheLine" style="font-size:14px;">⏳ চেক করা হচ্ছে...</p>
+    <button class="btn" style="width:100%;justify-content:center;" onclick="refreshDepCache()">🔄 এখন ক্যাশ রিফ্রেশ করুন</button>
+  </div>
+
+  <div class="card">
     <h3 style="margin-top:0;">🍪 Facebook Cookie / Appstate</h3>
     <p style="color:var(--muted);font-size:12.5px;">Cookie বা appstate.json পেস্ট করুন → সেভ হয়ে বট চালু হয়ে যাবে</p>
     <textarea id="appstateInput" rows="4" placeholder='[{"key":"c_user","value":"..."}] অথবা plain cookie string (name=value; name2=value2;)'></textarea>
@@ -1632,6 +1829,20 @@ function renderHome() {
           : '❌ ব্যর্থ: ' + d.msg;
       });
   }
+  function loadDepCache(){
+    fetch('/api/bot/dependency-cache').then(function(r){ return r.json(); }).then(function(d){
+      var el = document.getElementById('depCacheLine');
+      if (!d.cached) { el.innerHTML = '<span style="color:var(--yellow);">⚠️ এখনো ক্যাশ হয়নি</span> — প্রথমবার npm install সম্পন্ন হলে অটো ক্যাশ হবে।'; return; }
+      el.innerHTML = (d.upToDate ? '<span style="color:var(--green);">✅ ক্যাশ আছে (আপ-টু-ডেট)</span>' : '<span style="color:var(--yellow);">⚠️ ক্যাশ আছে কিন্তু পুরনো (package.json পাল্টেছে)</span>') +
+        ' — ' + d.sizeMB + 'MB, ' + new Date(d.cachedAt).toLocaleString();
+    });
+  }
+  function refreshDepCache(){
+    document.getElementById('depCacheLine').textContent = '⏳ ক্যাশ রিফ্রেশ হচ্ছে...';
+    fetch('/api/bot/dependency-cache/refresh', { method: 'POST' }).then(function(){ setTimeout(loadDepCache, 1500); });
+  }
+  loadDepCache();
+  setInterval(loadDepCache, 20000);
   refreshStatus();
   setInterval(refreshStatus, 8000);
   `);
@@ -1647,7 +1858,10 @@ function renderFiles() {
   <div class="card">
     <button class="btn" onclick="mkNew(true)">📁+ নতুন ফোল্ডার</button>
     <button class="btn" onclick="mkNew(false)">📄+ নতুন ফাইল</button>
+    <button class="btn primary" onclick="document.getElementById('hereUploadInput').click()">📤 এখানে ফাইল আপলোড</button>
     <button class="btn" onclick="downloadZip()">⬇️ Zip ডাউনলোড</button>
+    <input type="file" id="hereUploadInput" multiple style="display:none;" onchange="uploadHere(this.files)">
+    <p id="hereUploadResult" style="font-size:12.5px;color:var(--muted);margin-top:6px;"></p>
   </div>
   <div class="card" id="fileList">লোড হচ্ছে...</div>
   <div id="editorModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.8);z-index:80;padding:10px;">
@@ -1768,6 +1982,21 @@ function renderFiles() {
       body: JSON.stringify({ path: full }) }).then(function(){ load(curDir); });
   }
   function downloadZip(){ location.href = '/api/files/download-zip?dir=' + encodeURIComponent(curDir); }
+  function uploadHere(fileList){
+    if (!fileList || !fileList.length) return;
+    var fd = new FormData();
+    fd.append('dir', curDir);
+    for (var i = 0; i < fileList.length; i++) fd.append('files', fileList[i]);
+    document.getElementById('hereUploadResult').textContent = '⏳ আপলোড হচ্ছে... (' + fileList.length + 'টা ফাইল)';
+    fetch('/api/files/upload-here', { method: 'POST', body: fd })
+      .then(function(r){ return r.json(); }).then(function(d){
+        document.getElementById('hereUploadResult').textContent = d.ok
+          ? '✅ ' + d.count + 'টা ফাইল আপলোড হয়েছে'
+          : '❌ ব্যর্থ: ' + d.msg;
+        if (d.ok) load(curDir);
+      })
+      .catch(function(e){ document.getElementById('hereUploadResult').textContent = '❌ এরর: ' + e.message; });
+  }
   function onSearch(){
     var q = document.getElementById('searchBox').value;
     if (!q) { load(curDir); return; }
@@ -1994,6 +2223,13 @@ function renderUpload() {
 
 function renderSettings() {
   return page("সেটিংস", "/settings", `
+  <div class="card" style="border-color:#3b0764;">
+    <h3 style="margin-top:0;">🩺 সম্পূর্ণ স্বাস্থ্য পরীক্ষা</h3>
+    <p style="color:var(--muted);font-size:12.5px;">একবারে সবকিছু চেক করুন — Mongo, বট ফাইল, node_modules, dependency ক্যাশ, সবকিছু।</p>
+    <button class="btn primary" style="width:100%;justify-content:center;" onclick="runHealthCheck()">🩺 এখনই চেক করুন</button>
+    <div id="healthResult" style="margin-top:10px;"></div>
+  </div>
+
   <div class="card" id="mongoCard" style="border-color:#3a2f0f;">
     <h3 style="margin-top:0;">🗄️ MongoDB স্ট্যাটাস</h3>
     <p id="mongoStatusLine" style="font-size:14px;">⏳ চেক করা হচ্ছে...</p>
@@ -2085,6 +2321,18 @@ function renderSettings() {
       card.style.borderColor = '#3a1414';
       hint.textContent = extra || 'নিচের বাটনে চেপে টেস্ট করুন — সঠিক কারণ দেখাবে।';
     }
+  }
+  function runHealthCheck(){
+    document.getElementById('healthResult').innerHTML = '⏳ চেক করা হচ্ছে...';
+    fetch('/api/health-check').then(function(r){ return r.json(); }).then(function(d){
+      var html = '<div style="font-weight:700;margin-bottom:6px;">' +
+        (d.criticalOk ? '<span style="color:var(--green);">✅ মূল সিস্টেম ঠিক আছে</span>' : '<span style="color:var(--red);">⚠️ কিছু সমস্যা আছে</span>') + '</div>';
+      html += d.checks.map(function(c){
+        return '<div style="padding:5px 0;border-bottom:1px solid var(--border);font-size:13px;">' +
+          (c.ok ? '✅ ' : '❌ ') + '<b>' + c.name + '</b> — ' + c.detail + '</div>';
+      }).join('');
+      document.getElementById('healthResult').innerHTML = html;
+    });
   }
   function testMongo(){
     document.getElementById('mongoStatusLine').innerHTML = '⏳ টেস্ট করা হচ্ছে...';
