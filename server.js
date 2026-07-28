@@ -27,7 +27,7 @@ const CONFIG = {
   PANEL_PASSWORD:  process.env.PANEL_PASSWORD || "changeme123",
   SESSION_SECRET:  process.env.SESSION_SECRET || crypto.randomBytes(24).toString("hex"),
   MONGODB_URI:     process.env.MONGODB_URI || "",
-  BOT_DIR:         process.env.BOT_DIR || path.join(__dirname, "bot"),
+  BOT_DIR:         path.resolve(process.env.BOT_DIR || path.join(__dirname, "bot")),
   BOT_ENTRY:       process.env.BOT_ENTRY || "index.js",
   GITHUB_REPO:     process.env.GITHUB_REPO || "",
   GITHUB_BRANCH:   process.env.GITHUB_BRANCH || "main",
@@ -246,11 +246,12 @@ async function mongoRestoreFiles() {
 // "reponame-main/" বা কারো নিজের "bot/" ফোল্ডার), সেটার ভেতরের সবকিছু এক ধাপ উপরে তুলে আনে —
 // নাহলে bot/bot/index.js এর মতো ডাবল-নেস্টেড পাথ তৈরি হয়ে বট চালু হতে ব্যর্থ হয়
 async function flattenSingleRootFolder(dir) {
+  let changed = false;
   for (let depth = 0; depth < 3; depth++) {
     let entries;
-    try { entries = await fsp.readdir(dir, { withFileTypes: true }); } catch { return; }
+    try { entries = await fsp.readdir(dir, { withFileTypes: true }); } catch { return changed; }
     const visible = entries.filter((e) => e.name !== "__MACOSX" && !e.name.startsWith("."));
-    if (visible.length !== 1 || !visible[0].isDirectory()) return; // একাধিক আইটেম বা সরাসরি ফাইল থাকলে flatten দরকার নেই
+    if (visible.length !== 1 || !visible[0].isDirectory()) return changed; // একাধিক আইটেম বা সরাসরি ফাইল থাকলে flatten দরকার নেই
     const wrapperName = visible[0].name;
     const wrapperPath = path.join(dir, wrapperName);
     const inner = await fsp.readdir(wrapperPath, { withFileTypes: true });
@@ -259,6 +260,21 @@ async function flattenSingleRootFolder(dir) {
     }
     await fsp.rmdir(wrapperPath).catch(() => {});
     pushLog("info", `📦 zip-এর ভেতরের "${wrapperName}" র‍্যাপার ফোল্ডার সরিয়ে ফাইলগুলো রুটে আনা হলো।`);
+    changed = true;
+  }
+  return changed;
+}
+
+// এন্ট্রি ফাইল (index.js) খুঁজে না পেলে ডিরেক্টরির আসল অবস্থা লগে দেখিয়ে দেয় —
+// পরের বার screenshot চালাচালি না করেই কারণ বোঝা যায়
+async function logBotDirStructureIfEntryMissing() {
+  if (fs.existsSync(getBotEntryPath())) return;
+  try {
+    const entries = await fsp.readdir(CONFIG.BOT_DIR, { withFileTypes: true });
+    const listing = entries.slice(0, 20).map((e) => (e.isDirectory() ? e.name + "/" : e.name)).join(", ") || "(খালি)";
+    pushLog("error", `⚠️ ${CONFIG.BOT_ENTRY} পাওয়া যায়নি "${CONFIG.BOT_DIR}"-এ। ভেতরে যা আছে: ${listing}`);
+  } catch (e) {
+    pushLog("error", `⚠️ ${CONFIG.BOT_DIR} ফোল্ডার পড়া যায়নি: ${e.message}`);
   }
 }
 
@@ -294,7 +310,14 @@ async function githubImportZipIfNeeded(force) {
   if (existingCount > 0 && !force) {
     pushLog("info", "MongoDB-তে আগে থেকেই বট ফাইল ব্যাকআপ আছে — GitHub স্কিপ, MongoDB থেকেই ডিস্কে রিস্টোর করা হচ্ছে (Mongo-ই সোর্স অফ ট্রুথ, ডিস্ক ephemeral)।");
     await mongoRestoreFiles();
-    return { ok: true, restored: true };
+    // পুরনো ব্যাকআপ যদি ভুল/ডাবল-নেস্টেড স্ট্রাকচারে সেভ হয়ে থাকে, এখানে ঠিক করে আবার Mongo-তেও ফিক্স করে ফেলা হয়
+    const fixed = await flattenSingleRootFolder(CONFIG.BOT_DIR);
+    if (fixed) {
+      pushLog("warning", "🔧 আগের ব্যাকআপে ডাবল-নেস্টেড ফোল্ডার সমস্যা পাওয়া গেছে — ঠিক করে MongoDB-তে আবার সেভ করা হচ্ছে।");
+      await mongoBackupFiles();
+    }
+    await logBotDirStructureIfEntryMissing();
+    return { ok: true, restored: true, fixed };
   }
   if (!CONFIG.GITHUB_REPO) {
     pushLog("info", "GITHUB_REPO সেট নেই এবং MongoDB-তেও কোনো ফাইল নেই — বট শুরু থেকে খালি থাকবে।");
@@ -320,6 +343,7 @@ async function githubImportZipIfNeeded(force) {
     await fsp.unlink(tmpZip).catch(() => {});
     await flattenSingleRootFolder(CONFIG.BOT_DIR);
     pushLog("success", "✅ GitHub zip এক্সট্র্যাক্ট হয়েছে বট ফোল্ডারে।");
+    await logBotDirStructureIfEntryMissing();
 
     const backup = await mongoBackupFiles(); // এখন থেকে MongoDB-ই সোর্স অফ ট্রুথ
     await mongoDb.collection("state").updateOne(
@@ -374,7 +398,7 @@ function pushNotification(type, text) {
 // ৪. বট প্রসেস ম্যানেজার (fork + IPC)
 // ---------------------------------------------------------------------------
 function getBotEntryPath() {
-  return path.join(CONFIG.BOT_DIR, CONFIG.BOT_ENTRY);
+  return path.resolve(CONFIG.BOT_DIR, CONFIG.BOT_ENTRY);
 }
 
 function startBot(reason = "manual") {
@@ -383,7 +407,11 @@ function startBot(reason = "manual") {
     return;
   }
   if (!fs.existsSync(getBotEntryPath())) {
-    pushLog("error", `বট এন্ট্রি ফাইল পাওয়া যায়নি: ${CONFIG.BOT_ENTRY}`);
+    pushLog("error", `❌ বট এন্ট্রি ফাইল পাওয়া যায়নি: ${CONFIG.BOT_ENTRY} (পাথ: ${getBotEntryPath()})`);
+    logBotDirStructureIfEntryMissing();
+    STATE.wantBotRunning = false; // এন্ট্রি ফাইল না থাকলে বারবার ব্যর্থ auto-restart loop বন্ধ রাখা হলো
+    STATE.botStatus = "offline";
+    broadcast({ kind: "status", status: STATE.botStatus });
     return;
   }
   STATE.botStatus = "booting";
@@ -690,7 +718,13 @@ app.post("/api/bot/restart", (req, res) => { restartBot("panel-button"); res.jso
 app.post("/api/bot/npm-install", async (req, res) => { const r = await runNpmInstall(); res.json(r); });
 app.post("/api/bot/backup", async (req, res) => { const r = await mongoBackupFiles(); res.json(r); });
 app.post("/api/bot/mongo-sync", async (req, res) => { await mongoRestoreState(); res.json({ ok: true }); });
-app.post("/api/bot/restore", async (req, res) => { const r = await mongoRestoreFiles(); res.json(r); });
+app.post("/api/bot/restore", async (req, res) => {
+  const r = await mongoRestoreFiles();
+  const fixed = await flattenSingleRootFolder(CONFIG.BOT_DIR);
+  if (fixed) await mongoBackupFiles();
+  await logBotDirStructureIfEntryMissing();
+  res.json({ ...r, fixed });
+});
 
 // পেস্ট করা cookie/appstate টেক্সটকে fca-unofficial এর appstate.json ফরম্যাটে রূপান্তর করে
 function parseAppstateInput(raw) {
@@ -725,12 +759,16 @@ app.post("/api/bot/set-appstate", async (req, res) => {
     const appstate = parseAppstateInput(req.body.text);
     await fsp.mkdir(CONFIG.BOT_DIR, { recursive: true });
     await fsp.writeFile(path.join(CONFIG.BOT_DIR, "appstate.json"), JSON.stringify(appstate, null, 2), "utf8");
-    pushLog("success", "🍪 Facebook cookie/appstate সেভ হয়েছে — বট চালু করা হচ্ছে।");
+    pushLog("success", "🍪 Facebook cookie/appstate সেভ হয়েছে।");
+    const fixed = await flattenSingleRootFolder(CONFIG.BOT_DIR); // পুরনো ডাবল-নেস্টেড সমস্যা থাকলে এখানেই ঠিক হয়ে যাবে
+    if (fixed) pushLog("warning", "🔧 ফোল্ডার স্ট্রাকচার ঠিক করা হলো (ডাবল-নেস্টেড ফোল্ডার সরানো হয়েছে)।");
+    await logBotDirStructureIfEntryMissing();
     if (mongoDb) {
       await mongoBackupFiles().catch(() => {});
     }
+    pushLog("info", "▶ বট চালু করা হচ্ছে...");
     restartBot("appstate-updated");
-    res.json({ ok: true });
+    res.json({ ok: true, fixed });
   } catch (e) {
     res.json({ ok: false, msg: e.message });
   }
@@ -748,6 +786,7 @@ app.post("/api/bot/upload-zip", uploadMem.single("zipfile"), async (req, res) =>
     zip.extractAllTo(CONFIG.BOT_DIR, true);
     await flattenSingleRootFolder(CONFIG.BOT_DIR);
     pushLog("success", "✅ আপলোড করা zip এক্সট্র্যাক্ট হয়েছে।");
+    await logBotDirStructureIfEntryMissing();
     const backup = await mongoBackupFiles();
     pushNotification("manual-upload", `ফোন থেকে সরাসরি আপলোড করা bot.zip ইম্পোর্ট হয়েছে (${backup.count || 0} ফাইল)।`);
     res.json({ ok: true, count: backup.count || 0 });
