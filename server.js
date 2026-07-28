@@ -140,16 +140,30 @@ let mongoClient = null, mongoDb = null;
 async function mongoConnect() {
   if (!CONFIG.MONGODB_URI) {
     pushLog("warning", "MONGODB_URI সেট নেই — MongoDB ব্যাকআপ বন্ধ থাকবে (লোকাল মেমোরি/ডিস্কেই থাকবে)।");
-    return;
+    return { ok: false, msg: "MONGODB_URI সেট নেই", hint: "Render Environment ট্যাবে MONGODB_URI বসান" };
   }
   try {
+    if (mongoClient) { try { await mongoClient.close(); } catch {} }
     const { MongoClient } = require("mongodb");
     mongoClient = new MongoClient(CONFIG.MONGODB_URI, { serverSelectionTimeoutMS: 8000 });
     await mongoClient.connect();
+    await mongoClient.db("admin").command({ ping: 1 }); // সত্যিই কানেক্ট হয়েছে কিনা নিশ্চিত করতে ping
     mongoDb = mongoClient.db("bot_panel");
     pushLog("success", "✅ MongoDB Atlas সংযুক্ত হয়েছে।");
+    return { ok: true };
   } catch (e) {
-    pushLog("error", "❌ MongoDB সংযোগ ব্যর্থ: " + e.message);
+    mongoDb = null;
+    const msg = e.message || String(e);
+    let hint = "কারণ নির্দিষ্ট করা যায়নি — নিচের msg দেখে চেক করুন।";
+    if (/bad auth|authentication failed/i.test(msg)) {
+      hint = "ইউজারনেম/পাসওয়ার্ড ভুল — MongoDB Atlas-এ Database Access-এ গিয়ে পাসওয়ার্ড আবার চেক/রিসেট করুন। পাসওয়ার্ডে বিশেষ ক্যারেক্টার (@ # ইত্যাদি) থাকলে URL-encode করা হয়েছে কিনা দেখুন।";
+    } else if (/whitelist|ip address|network|ETIMEDOUT|querySrv|ENOTFOUND|serverSelectionTimeoutMS/i.test(msg)) {
+      hint = "সবচেয়ে সম্ভাব্য কারণ: MongoDB Atlas-এর Network Access-এ 0.0.0.0/0 (Allow access from anywhere) যোগ করা হয়নি — Atlas → Network Access → Add IP Address → Allow Access from Anywhere।";
+    } else if (/Invalid connection string|invalid scheme/i.test(msg)) {
+      hint = "MONGODB_URI ফরম্যাট ভুল — mongodb+srv:// দিয়ে শুরু হচ্ছে কিনা, এবং পুরো স্ট্রিং ঠিকমতো কপি হয়েছে কিনা চেক করুন।";
+    }
+    pushLog("error", `❌ MongoDB সংযোগ ব্যর্থ: ${msg}`);
+    return { ok: false, msg, hint };
   }
 }
 
@@ -1145,6 +1159,24 @@ app.post("/api/reset", (req, res) => {
   res.json({ ok: true });
 });
 
+app.post("/api/settings/reset-lifetime", async (req, res) => {
+  STATE.lifetime = { totalStarts: 0, totalCrashes: 0, totalUptimeMs: 0, trackingSince: Date.now() };
+  STATE.restartHistory = [];
+  STATE.panelRamMax = 0;
+  STATE.botRamMax = 0;
+  STATE.mongoStorageMax = 0;
+  if (mongoDb) await mongoSaveState().catch(() => {});
+  pushLog("info", "🔄 লাইফটাইম পরিসংখ্যান (Start/Crash/RAM max/রিস্টার্ট ইতিহাস) রিসেট করা হলো।");
+  res.json({ ok: true });
+});
+
+app.post("/api/settings/reset-notifications", (req, res) => {
+  STATE.notifications = [];
+  STATE.notifCooldowns = {};
+  if (mongoDb) mongoSaveState().catch(() => {});
+  res.json({ ok: true });
+});
+
 app.get("/more", (req, res) => res.send(renderMore()));
 
 app.get("/settings", (req, res) => res.send(renderSettings()));
@@ -1177,6 +1209,19 @@ app.post("/api/settings/import-now", async (req, res) => {
 
 // ভুল/ডাবল-নেস্টেড ইম্পোর্ট হয়ে গেলে MongoDB + ডিস্ক থেকে বট ফাইল সম্পূর্ণ মুছে ফেলে —
 // এরপর আবার ইম্পোর্ট/আপলোড করলে একদম ফ্রেশ শুরু হবে
+app.post("/api/settings/test-mongo", async (req, res) => {
+  const r = await mongoConnect(); // re-attempt connection right now, without needing a redeploy
+  if (r.ok) {
+    await loadSettingsFromMongo();
+    await githubImportZipIfNeeded(); // এখন কানেক্ট হয়েছে তো — MongoDB-তে ডেটা থাকলে রিস্টোর করে ফেলুক
+  }
+  res.json(r);
+});
+
+app.get("/api/status-badges", (req, res) => {
+  res.json({ ok: true, botStatus: STATE.botStatus, dbConnected: !!mongoDb });
+});
+
 app.post("/api/settings/wipe-bot-files", async (req, res) => {
   try {
     if (mongoDb) {
@@ -1395,18 +1440,60 @@ function renderLogin(err) {
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
   <title>লগইন — Bot Panel</title><style>${baseCss()}
-  body{display:flex;align-items:center;justify-content:center;min-height:100vh;}
-  .box{width:100%;max-width:340px;padding:24px;}</style>
+  body{display:flex;align-items:center;justify-content:center;min-height:100vh;
+       background:radial-gradient(circle at 30% 20%,#1e1145 0%,#0b0f14 55%),
+                  radial-gradient(circle at 80% 80%,#3b0764 0%,transparent 45%);
+       overflow:hidden;padding-bottom:0;}
+  .box{width:100%;max-width:340px;padding:32px 26px;position:relative;z-index:2;
+       background:rgba(18,24,33,.85);backdrop-filter:blur(6px);
+       border:1px solid rgba(168,85,247,.35);box-shadow:0 0 40px rgba(99,102,241,.25);}
+  .robotwrap{width:74px;height:74px;margin:0 auto 14px;border-radius:20px;
+       background:linear-gradient(135deg,#6366f1,#a855f7,#ec4899);
+       display:flex;align-items:center;justify-content:center;font-size:34px;
+       box-shadow:0 0 30px rgba(168,85,247,.6);animation:floatIcon 3s ease-in-out infinite;}
+  @keyframes floatIcon{0%,100%{transform:translateY(0);}50%{transform:translateY(-6px);}}
+  .brandtitle{text-align:center;font-size:24px;font-weight:800;margin:0 0 2px;
+       background:linear-gradient(90deg,#a78bfa,#f0abfc,#f472b6);
+       -webkit-background-clip:text;background-clip:text;color:transparent;}
+  .brandsub{text-align:center;color:var(--muted);font-size:12.5px;margin-bottom:18px;}
+  .glow-btn{background:linear-gradient(90deg,#7c3aed,#db2777);border:none;
+       width:100%;padding:13px;border-radius:12px;color:#fff;font-weight:700;font-size:15px;
+       margin-top:12px;cursor:pointer;box-shadow:0 6px 20px rgba(124,58,237,.4);}
+  .glow-btn:active{transform:scale(0.98);}
+  .particle{position:absolute;border-radius:50%;background:rgba(168,85,247,.5);
+       filter:blur(1px);animation:floatUp linear infinite;}
+  @keyframes floatUp{from{transform:translateY(0);opacity:.7;}to{transform:translateY(-110vh);opacity:0;}}
+  </style>
   <script>${clientErrorCatcher()}</script></head><body>
   <div id="errbox"></div>
-  <div class="box card">
-    <h2 style="text-align:center;">🤖 Bot Panel</h2>
-    ${err ? `<p style="color:var(--red);text-align:center;">${err}</p>` : ""}
+  <div id="particles"></div>
+  <div class="box">
+    <div class="robotwrap">🤖</div>
+    <div class="brandtitle">Bot Panel</div>
+    <div class="brandsub">তোমার বট কন্ট্রোল সেন্টার</div>
+    ${err ? `<p style="color:#f87171;text-align:center;font-size:13.5px;">❌ ${err}</p>` : ""}
     <form method="POST" action="/login">
-      <input type="password" name="password" placeholder="পাসওয়ার্ড দিন" autofocus required>
-      <button class="btn primary" style="width:100%;margin-top:10px;justify-content:center;" type="submit">লগইন</button>
+      <input type="password" name="password" placeholder="🔐 পাসওয়ার্ড দিন" autofocus required
+        style="text-align:center;border-color:rgba(168,85,247,.4);">
+      <button class="glow-btn" type="submit">প্রবেশ করুন →</button>
     </form>
-  </div></body></html>`;
+  </div>
+  <script>
+    var box = document.getElementById('particles');
+    for (var i = 0; i < 18; i++) {
+      var p = document.createElement('div');
+      var size = 2 + Math.random() * 4;
+      p.className = 'particle';
+      p.style.width = size + 'px';
+      p.style.height = size + 'px';
+      p.style.left = (Math.random() * 100) + 'vw';
+      p.style.top = (50 + Math.random() * 50) + 'vh';
+      p.style.animationDuration = (6 + Math.random() * 8) + 's';
+      p.style.animationDelay = (Math.random() * 6) + 's';
+      box.appendChild(p);
+    }
+  </script>
+  </body></html>`;
 }
 
 function formatDuration(ms) {
@@ -1868,8 +1955,11 @@ function renderUpload() {
 
 function renderSettings() {
   return page("সেটিংস", "/settings", `
-  <div class="card" id="mongoWarn" style="display:none;background:#3a2f0f;">
-    ⚠️ MongoDB কানেক্টেড নয় — এখানের সেটিংস সেভ হলেও পরের রিস্টার্টে হারিয়ে যাবে। আগে Render-এ <code>MONGODB_URI</code> বসান।
+  <div class="card" id="mongoCard" style="border-color:#3a2f0f;">
+    <h3 style="margin-top:0;">🗄️ MongoDB স্ট্যাটাস</h3>
+    <p id="mongoStatusLine" style="font-size:14px;">⏳ চেক করা হচ্ছে...</p>
+    <button class="btn primary" style="width:100%;justify-content:center;" onclick="testMongo()">🔌 এখনই টেস্ট / রিকানেক্ট করুন</button>
+    <p id="mongoHint" style="font-size:12.5px;color:var(--muted);margin-top:8px;"></p>
   </div>
 
   <div class="card">
@@ -1900,6 +1990,15 @@ function renderSettings() {
   </div>
 
   <div class="card">
+    <h3 style="margin-top:0;">🔄 রিসেট সেন্টার</h3>
+    <p style="color:var(--muted);font-size:12.5px;">যেটা দরকার শুধু সেটাই রিসেট করুন — একেবারে সব একসাথে মোছার দরকার নেই।</p>
+    <button class="btn" style="width:100%;justify-content:center;margin-top:6px;" onclick="doReset('/api/reset','লগ ও নোটিফিকেশন')">🧹 লগ + নোটিফিকেশন খালি করুন</button>
+    <button class="btn" style="width:100%;justify-content:center;margin-top:6px;" onclick="doReset('/api/settings/reset-notifications','নোটিফিকেশন')">🔔 শুধু নোটিফিকেশন খালি করুন</button>
+    <button class="btn" style="width:100%;justify-content:center;margin-top:6px;" onclick="doReset('/api/settings/reset-lifetime','লাইফটাইম Start/Crash/RAM পরিসংখ্যান')">📊 লাইফটাইম পরিসংখ্যান রিসেট করুন</button>
+    <p id="resetCenterResult" style="font-size:12.5px;color:var(--muted);margin-top:6px;"></p>
+  </div>
+
+  <div class="card">
     <h3 style="margin-top:0;">⏰ শিডিউল</h3>
     <label style="font-size:12.5px;color:var(--muted);">রোজ কোন ঘণ্টায় (0-23) বট অটো-রিস্টার্ট হবে (ঐচ্ছিক, ফাঁকা রাখলে বন্ধ)</label>
     <input id="s-restarthour" placeholder="যেমন: 4 (রাত ৪টা)">
@@ -1918,7 +2017,7 @@ function renderSettings() {
   `, `
   function loadSettings(){
     fetch('/api/settings').then(function(r){ return r.json(); }).then(function(d){
-      if (!d.mongoConnected) document.getElementById('mongoWarn').style.display = 'block';
+      renderMongoStatus(d.mongoConnected, null);
       document.getElementById('s-repo').value = d.GITHUB_REPO || '';
       document.getElementById('s-branch').value = d.GITHUB_BRANCH || 'main';
       document.getElementById('s-zippath').value = d.GITHUB_ZIP_PATH || 'bot.zip';
@@ -1932,6 +2031,32 @@ function renderSettings() {
         document.getElementById('lockedNote').textContent =
           'নোট: এই ফিল্ডগুলো Render Environment Variable থেকে সেট করা আছে, তাই এখান থেকে পরিবর্তন কাজ করবে না যতক্ষণ না Render থেকে মুছবেন: ' + d.lockedByEnv.join(', ');
       }
+    });
+  }
+  function renderMongoStatus(connected, extra){
+    var line = document.getElementById('mongoStatusLine');
+    var card = document.getElementById('mongoCard');
+    var hint = document.getElementById('mongoHint');
+    if (connected) {
+      line.innerHTML = '<span style="color:var(--green);">✅ সংযুক্ত আছে</span> — ফাইল ও সেটিংস স্থায়ীভাবে সেভ হচ্ছে';
+      card.style.borderColor = '#0f3a1e';
+      hint.textContent = '';
+    } else {
+      line.innerHTML = '<span style="color:var(--red);">❌ সংযুক্ত নেই</span> — ফাইল/সেটিংস রিস্টার্টে হারিয়ে যাবে';
+      card.style.borderColor = '#3a1414';
+      hint.textContent = extra || 'নিচের বাটনে চেপে টেস্ট করুন — সঠিক কারণ দেখাবে।';
+    }
+  }
+  function testMongo(){
+    document.getElementById('mongoStatusLine').innerHTML = '⏳ টেস্ট করা হচ্ছে...';
+    fetch('/api/settings/test-mongo', { method: 'POST' }).then(function(r){ return r.json(); }).then(function(d){
+      renderMongoStatus(d.ok, d.ok ? null : (d.msg + (d.hint ? ' — ' + d.hint : '')));
+    });
+  }
+  function doReset(url, label){
+    if (!confirm(label + ' রিসেট করবেন?')) return;
+    fetch(url, { method: 'POST' }).then(function(r){ return r.json(); }).then(function(d){
+      document.getElementById('resetCenterResult').textContent = d.ok ? '✅ ' + label + ' রিসেট হয়েছে।' : '❌ ব্যর্থ: ' + d.msg;
     });
   }
   function saveSettings(){
