@@ -2391,9 +2391,9 @@ function langExt(n){const e=n.split(".").pop().toLowerCase();return{js:"JavaScri
 function buildPath(dir){
   const bar=document.getElementById("pathBar");
   const parts=dir?dir.split("/"):[];
-  let html='<span class="pp" onclick="loadFiles(\\'\\')">📁 root</span>';
+  let html='<span class="pp" onclick="loadFiles(\'\')">📁 root</span>';
   let acc="";
-  parts.forEach(p=>{acc+=(acc?"/":"")+p;const c=acc;html+='<span style="color:var(--mu)"> / </span><span class="pp" onclick="loadFiles(\\''+c+'\\')">'+p+'</span>';});
+  parts.forEach(p=>{acc+=(acc?"/":"")+p;const c=acc;html+='<span style="color:var(--mu)"> / </span><span class="pp" onclick="loadFiles(\''+c+'\')">'+p+'</span>';});
   bar.innerHTML=html;
 }
 
@@ -2421,12 +2421,12 @@ async function loadFiles(dir){
     row.innerHTML='<span class="fi '+ftype(item.name,item.isDir)+'">'+ficon(item.name,item.isDir)+'</span>'
       +'<div class="fn"><div class="fn-name">'+item.name+'</div><div class="fn-meta">'+fsz(item.size)+(item.mtime?' · <span data-mtime="'+item.mtime+'">'+fdt(item.mtime)+'</span>':"")+'</div></div>'
       +'<div class="fa">'
-      +(item.isDir?'':'<button class="fab" onclick="event.stopPropagation();editF(\\''+fp+'\\')">✏️</button>')
-      +(!item.isDir && /\.js$/i.test(item.name)?'<button class="fab" onclick="event.stopPropagation();quickTest(\\''+fp+'\\')">🧪</button>':'')
-      +'<button class="fab" onclick="event.stopPropagation();dlF(\\''+fp+'\\')">⬇️</button>'
-      +'<button class="fab" onclick="event.stopPropagation();showRename(\\''+fp+'\\',\\''+item.name+'\\')">🔤</button>'
-      +'<button class="fab" onclick="event.stopPropagation();showCopy(\\''+fp+'\\')">📋</button>'
-      +'<button class="fab del" onclick="event.stopPropagation();delItem(\\''+fp+'\\',\\''+item.name+'\\')">🗑</button>'
+      +(item.isDir?'':'<button class="fab" onclick="event.stopPropagation();editF(\''+fp+'\')">✏️</button>')
+      +(!item.isDir && /\.js$/i.test(item.name)?'<button class="fab" onclick="event.stopPropagation();quickTest(\''+fp+'\')">🧪</button>':'')
+      +'<button class="fab" onclick="event.stopPropagation();dlF(\''+fp+'\')">⬇️</button>'
+      +'<button class="fab" onclick="event.stopPropagation();showRename(\''+fp+'\',\''+item.name+'\')">🔤</button>'
+      +'<button class="fab" onclick="event.stopPropagation();showCopy(\''+fp+'\')">📋</button>'
+      +'<button class="fab del" onclick="event.stopPropagation();delItem(\''+fp+'\',\''+item.name+'\')">🗑</button>'
       +'</div>';
     if(item.isDir) row.onclick=()=>loadFiles(fp);
     else row.onclick=()=>editF(fp);
